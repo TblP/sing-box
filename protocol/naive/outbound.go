@@ -4,6 +4,8 @@ package naive
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/pem"
 	"net"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/naive/masque"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -37,10 +40,11 @@ var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
 
 type Outbound struct {
 	outbound.Adapter
-	ctx       context.Context
-	logger    logger.ContextLogger
-	client    *cronet.NaiveClient
-	uotClient *uot.Client
+	ctx          context.Context
+	logger       logger.ContextLogger
+	client       *cronet.NaiveClient
+	uotClient    *uot.Client
+	masqueClient *masque.Client
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveOutboundOptions) (adapter.Outbound, error) {
@@ -208,18 +212,42 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			Version: uotOptions.Version,
 		}
 	}
+	var masqueClient *masque.Client
+	if options.UDPOverHTTP3 {
+		tlsConfig := &tls.Config{
+			ServerName: serverName,
+			NextProtos: []string{"h3"},
+		}
+		if trustedRootCertificates != "" {
+			rootCAs := x509.NewCertPool()
+			if !rootCAs.AppendCertsFromPEM([]byte(trustedRootCertificates)) {
+				return nil, E.New("parse trusted root certificates")
+			}
+			tlsConfig.RootCAs = rootCAs
+		}
+		masqueClient = masque.New(masque.Config{
+			ServerAddr:   serverAddress.String(),
+			ServerName:   serverName,
+			TLSConfig:    tlsConfig,
+			Username:     options.Username,
+			Password:     options.Password,
+			ExtraHeaders: extraHeaders,
+			ChromeParrot: true,
+		})
+	}
 	var networks []string
-	if uotClient != nil {
+	if uotClient != nil || masqueClient != nil {
 		networks = []string{N.NetworkTCP, N.NetworkUDP}
 	} else {
 		networks = []string{N.NetworkTCP}
 	}
 	return &Outbound{
-		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeNaive, tag, networks, options.DialerOptions),
-		ctx:       ctx,
-		logger:    logger,
-		client:    client,
-		uotClient: uotClient,
+		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeNaive, tag, networks, options.DialerOptions),
+		ctx:          ctx,
+		logger:       logger,
+		client:       client,
+		uotClient:    uotClient,
+		masqueClient: masqueClient,
 	}, nil
 }
 
@@ -232,6 +260,9 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		return err
 	}
 	scope.Add(h.client.Close)
+	if h.masqueClient != nil {
+		scope.Add(h.masqueClient.Close)
+	}
 	h.logger.Info("NaiveProxy started, version: ", h.client.Engine().Version())
 	return nil
 }
@@ -242,6 +273,10 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
 		return h.client.DialEarly(ctx, destination)
 	case N.NetworkUDP:
+		if h.masqueClient != nil {
+			h.logger.InfoContext(ctx, "outbound CONNECT-UDP connection to ", destination)
+			return h.masqueClient.DialContext(ctx, destination.String())
+		}
 		if h.uotClient == nil {
 			return nil, E.New("UDP is not supported unless UDP over TCP is enabled")
 		}
@@ -253,6 +288,10 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if h.masqueClient != nil {
+		h.logger.InfoContext(ctx, "outbound CONNECT-UDP packet connection to ", destination)
+		return h.masqueClient.ListenPacket(ctx, destination.String())
+	}
 	if h.uotClient == nil {
 		return nil, E.New("UDP is not supported unless UDP over TCP is enabled")
 	}
@@ -265,6 +304,9 @@ func (h *Outbound) MultiplexEnabled() bool {
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	h.client.CloseAllConnections()
+	if h.masqueClient != nil {
+		_ = h.masqueClient.Close()
+	}
 }
 
 func (h *Outbound) Client() *cronet.NaiveClient {

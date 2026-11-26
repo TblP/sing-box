@@ -23,6 +23,7 @@ type NaiveOutboundOptions struct {
 	ExtraHeaders             badoption.HTTPHeader     `json:"extra_headers,omitempty"`
 	ReceiveWindow            *byteformats.MemoryBytes `json:"stream_receive_window,omitempty"`
 	UDPOverTCP               *UDPOverTCPOptions       `json:"udp_over_tcp,omitempty"`
+	UDPOverHTTP3             bool                     `json:"udp_over_http3,omitempty"`
 	QUIC                     bool                     `json:"quic,omitempty"`
 	QUICCongestionControl    string                   `json:"quic_congestion_control,omitempty" enum:"bbr,bbr2,cubic,reno"`
 	QUICSessionReceiveWindow *byteformats.MemoryBytes `json:"quic_session_receive_window,omitempty"`
