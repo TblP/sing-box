@@ -1,0 +1,65 @@
+name: Build macOS sidecar
+
+# Разовая сборка sidecar для macOS (arm64) из ветки unigate/udp-masque.
+# cgo обязателен: cronet-go для darwin поставляется только как libcronet.a,
+# shared-библиотеки (libcronet.dylib) нет, поэтому purego-сборка не подходит.
+# Артефакт кладётся в релиз singbox-1.14.4-masque.1.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+
+      - name: Build sing-box (cgo, static cronet)
+        env:
+          CGO_ENABLED: "1"
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go build \
+            -tags "with_naive_outbound,with_quic,with_gvisor,with_wireguard,with_utls,with_clash_api" \
+            -trimpath \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=1.14.4" \
+            -o dist/sing-box ./cmd/sing-box
+          file dist/sing-box
+          dist/sing-box version
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd dist
+          tar czf ../sing-box-1.14.4-masque.1-darwin-arm64.tar.gz sing-box
+          cd ..
+          shasum -a 256 sing-box-1.14.4-masque.1-darwin-arm64.tar.gz | tee SHA256SUMS.txt
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload singbox-1.14.4-masque.1 \
+            sing-box-1.14.4-masque.1-darwin-arm64.tar.gz --clobber
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-darwin-arm64
+          path: |
+            sing-box-1.14.4-masque.1-darwin-arm64.tar.gz
+            SHA256SUMS.txt
