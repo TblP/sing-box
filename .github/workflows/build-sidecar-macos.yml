@@ -43,22 +43,22 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          tar czf ../sing-box-1.14.4-masque.2-darwin-arm64.tar.gz sing-box
+          tar czf ../sing-box-1.14.4-masque.3-darwin-arm64.tar.gz sing-box
           cd ..
-          shasum -a 256 sing-box-1.14.4-masque.2-darwin-arm64.tar.gz | tee SHA256SUMS.txt
+          shasum -a 256 sing-box-1.14.4-masque.3-darwin-arm64.tar.gz | tee SHA256SUMS.txt
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release upload singbox-1.14.4-masque.2 \
-            sing-box-1.14.4-masque.2-darwin-arm64.tar.gz --clobber
+          gh release upload singbox-1.14.4-masque.3 \
+            sing-box-1.14.4-masque.3-darwin-arm64.tar.gz --clobber
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: sing-box-darwin-arm64
           path: |
-            sing-box-1.14.4-masque.2-darwin-arm64.tar.gz
+            sing-box-1.14.4-masque.3-darwin-arm64.tar.gz
             SHA256SUMS.txt
