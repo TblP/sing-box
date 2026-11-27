@@ -21,6 +21,8 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 const (
@@ -30,7 +32,7 @@ const (
 
 var (
 	ErrDatagramTooLarge = errors.New("masque: datagram too large")
-	ErrNoConnection      = errors.New("masque: no connection")
+	ErrNoConnection     = errors.New("masque: no connection")
 )
 
 var contextIDZero = quicvarint.Append(nil, 0)
@@ -51,23 +53,36 @@ type Config struct {
 	ChromeParrot bool
 	// MaxDatagramSize is the largest UDP payload sent in one HTTP Datagram.
 	MaxDatagramSize int
+	// Dialer creates the UDP socket for the HTTP/3 connection. When set, the
+	// socket goes through the outbound dialer (and is protected from the TUN
+	// on Android); without it the OS route is used, which loops inside a TUN.
+	Dialer N.Dialer
 }
 
 type Client struct {
 	config Config
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	mu        sync.Mutex
+	udpConn   net.Conn
 	conn      *quic.Conn
 	transport *http3.Transport
 	h3        *http3.ClientConn
 	maxSize   int
+
+	// connectMu serializes dials. Close never takes it, so stopping the
+	// client is not blocked by an in-flight (possibly failing) H3 dial.
+	connectMu sync.Mutex
 }
 
 func New(config Config) *Client {
 	if config.MaxDatagramSize <= 0 {
 		config.MaxDatagramSize = defaultMaxDatagramSize
 	}
-	return &Client{config: config, maxSize: config.MaxDatagramSize}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Client{config: config, maxSize: config.MaxDatagramSize, ctx: ctx, cancel: cancel}
 }
 
 // ListenPacket opens a CONNECT-UDP flow to destination and returns it as a
@@ -146,10 +161,28 @@ func (c *Client) open(ctx context.Context, destination string) (*Flow, error) {
 
 func (c *Client) ensureConn(ctx context.Context) (*http3.ClientConn, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.h3 != nil && c.conn != nil && c.conn.Context().Err() == nil {
-		return c.h3, nil
+		h3 := c.h3
+		c.mu.Unlock()
+		return h3, nil
 	}
+	c.mu.Unlock()
+
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	// Another flow may have connected while we waited for connectMu.
+	c.mu.Lock()
+	if c.h3 != nil && c.conn != nil && c.conn.Context().Err() == nil {
+		h3 := c.h3
+		c.mu.Unlock()
+		return h3, nil
+	}
+	c.mu.Unlock()
+	if err := c.ctx.Err(); err != nil {
+		return nil, fmt.Errorf("masque: client closed")
+	}
+
 	tlsConfig := &tls.Config{NextProtos: []string{http3.NextProtoH3}}
 	if c.config.TLSConfig != nil {
 		tlsConfig = c.config.TLSConfig.Clone()
@@ -161,35 +194,86 @@ func (c *Client) ensureConn(ctx context.Context) (*http3.ClientConn, error) {
 		tlsConfig.NextProtos = []string{http3.NextProtoH3}
 	}
 	quicConfig := &quic.Config{
-		EnableDatagrams: true,
-		ChromeParrot:    c.config.ChromeParrot,
+		EnableDatagrams:      true,
+		ChromeParrot:         c.config.ChromeParrot,
+		HandshakeIdleTimeout: 10 * time.Second,
 	}
-	conn, err := quic.DialAddr(ctx, c.config.ServerAddr, tlsConfig, quicConfig)
+	// A failed handshake must never hold the dial past its deadline: Close
+	// cancels c.ctx and stops the wait (otherwise VPN shutdown ANRs).
+	dialCtx, cancelDial := context.WithTimeout(ctx, 12*time.Second)
+	stopAfter := context.AfterFunc(c.ctx, cancelDial)
+	defer func() {
+		stopAfter()
+		cancelDial()
+	}()
+
+	var conn *quic.Conn
+	var udpConn net.Conn
+	var err error
+	if c.config.Dialer != nil {
+		// Protected socket: on Android a raw UDP socket would be captured by
+		// the VPN's TUN and never reach the proxy.
+		udpConn, err = c.config.Dialer.DialContext(dialCtx, N.NetworkUDP,
+			M.ParseSocksaddr(c.config.ServerAddr))
+		if err != nil {
+			return nil, fmt.Errorf("masque: dial %s: %w", c.config.ServerAddr, err)
+		}
+		conn, err = quic.DialConn(dialCtx, udpConn, tlsConfig, quicConfig)
+	} else {
+		conn, err = quic.DialAddr(dialCtx, c.config.ServerAddr, tlsConfig, quicConfig)
+	}
 	if err != nil {
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
 		return nil, fmt.Errorf("masque: dial %s: %w", c.config.ServerAddr, err)
 	}
+
 	transport := &http3.Transport{
 		EnableDatagrams: true,
 		TLSClientConfig: tlsConfig,
 	}
+	h3 := transport.NewClientConn(conn)
+
+	c.mu.Lock()
+	if err = c.ctx.Err(); err != nil {
+		c.mu.Unlock()
+		_ = conn.CloseWithError(0, "")
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
+		return nil, fmt.Errorf("masque: client closed")
+	}
+	c.udpConn = udpConn
 	c.conn = conn
 	c.transport = transport
-	c.h3 = transport.NewClientConn(conn)
-	return c.h3, nil
+	c.h3 = h3
+	c.mu.Unlock()
+	return h3, nil
 }
 
 func (c *Client) reset() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != nil {
-		_ = c.conn.CloseWithError(0, "")
-	}
+	conn := c.conn
+	udpConn := c.udpConn
 	c.conn = nil
+	c.udpConn = nil
 	c.transport = nil
 	c.h3 = nil
+	c.mu.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, "")
+	}
+	if udpConn != nil {
+		_ = udpConn.Close()
+	}
 }
 
+// Close stops the client without waiting for an in-flight dial. The caller
+// (libbox/VPN shutdown) runs on the Android main thread, so blocking here
+// turns into an ANR.
 func (c *Client) Close() error {
+	c.cancel()
 	c.reset()
 	return nil
 }

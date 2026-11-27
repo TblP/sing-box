@@ -233,6 +233,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			Password:     options.Password,
 			ExtraHeaders: extraHeaders,
 			ChromeParrot: true,
+			Dialer:       outboundDialer,
 		})
 	}
 	var networks []string
