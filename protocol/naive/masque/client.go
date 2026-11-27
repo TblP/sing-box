@@ -116,11 +116,7 @@ func (c *Client) open(ctx context.Context, destination string) (*Flow, error) {
 	}
 	request := &http.Request{
 		Method: http.MethodConnect,
-		URL: &url.URL{
-			Scheme: "https",
-			Host:   c.config.ServerAddr,
-			Path:   masquePathPrefix + escapeHost(host) + "/" + strconv.Itoa(port) + "/",
-		},
+		URL:    connectUDPURL(c.config.ServerAddr, host, port),
 		Host:   c.config.ServerAddr,
 		Proto:  "connect-udp",
 		Header: make(http.Header),
@@ -269,25 +265,48 @@ func (c *Client) reset() {
 	}
 }
 
-// Close stops the client without waiting for an in-flight dial. The caller
-// (libbox/VPN shutdown) runs on the Android main thread, so blocking here
-// turns into an ANR.
+// Close stops the client for good. Called when the outbound is removed.
 func (c *Client) Close() error {
 	c.cancel()
 	c.reset()
 	return nil
 }
 
+// Reset drops the current HTTP/3 connection but keeps the client usable.
+// Used on network changes: unlike Close, it must not cancel the client
+// context, otherwise every later flow fails with "client closed".
+func (c *Client) Reset() {
+	c.reset()
+}
+
 func escapeHost(host string) string {
 	if ip := net.ParseIP(host); ip != nil {
 		// RFC 9298 Section 2: IPv6 literals must have their colons
-		// percent-encoded, e.g. 2001%3Adb8%3A%3A42.
+		// percent-encoded, e.g. 2001%3Adb8%3A%3A42. A zone ID ("%eth0") is
+		// escaped as %25 so RawPath stays a valid encoding of the decoded
+		// path.
+		if strings.Contains(host, "%") {
+			host = strings.ReplaceAll(host, "%", "%25")
+		}
 		if strings.Contains(host, ":") {
 			return strings.ReplaceAll(host, ":", "%3A")
 		}
 		return host
 	}
 	return url.PathEscape(host)
+}
+
+// connectUDPURL builds the CONNECT-UDP request URL. Path holds the decoded
+// target and RawPath the RFC 9298 percent-encoded form; setting the encoded
+// text in Path would be escaped again ("%253A") when the request is written.
+func connectUDPURL(serverAddr, host string, port int) *url.URL {
+	suffix := "/" + strconv.Itoa(port) + "/"
+	return &url.URL{
+		Scheme:  "https",
+		Host:    serverAddr,
+		Path:    masquePathPrefix + host + suffix,
+		RawPath: masquePathPrefix + escapeHost(host) + suffix,
+	}
 }
 
 // Flow is one CONNECT-UDP request stream. It implements net.PacketConn and

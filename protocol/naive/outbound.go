@@ -306,7 +306,9 @@ func (h *Outbound) MultiplexEnabled() bool {
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	h.client.CloseAllConnections()
 	if h.masqueClient != nil {
-		_ = h.masqueClient.Close()
+		// Network change: drop the H3 connection but keep the client alive.
+		// Close would cancel its context and disable UDP until restart.
+		h.masqueClient.Reset()
 	}
 }
 
